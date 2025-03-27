@@ -406,7 +406,7 @@ fn url<'a, 'b>(
     move |i| {
         // Save the current input position
         let start = i.checkpoint();
-        
+
         // Try to match the first part of URL pattern "[text]"
         let display = match delimited::<_, _, _, _, Error<'a>, _, _, _>("[", take_until(1.., "]("), "]").parse_next(i) {
             Ok(display) => display,
@@ -414,9 +414,9 @@ fn url<'a, 'b>(
                 // If it doesn't match, reset position and fail
                 i.reset(&start);
                 return Err(ErrMode::from_error_kind(i, ErrorKind::Fail));
-            }
+            },
         };
-        
+
         // Try to match the second part of URL pattern "(url)"
         let link = match delimited::<_, _, _, _, Error<'a>, _, _, _>("(", take_till(0.., ')'), ")").parse_next(i) {
             Ok(link) => link,
@@ -424,9 +424,9 @@ fn url<'a, 'b>(
                 // If it doesn't match, reset position and fail
                 i.reset(&start);
                 return Err(ErrMode::from_error_kind(i, ErrorKind::Fail));
-            }
+            },
         };
-        
+
         // Only generate output if the complete URL pattern matches
         queue_newline_or_advance(&mut o, state, display.width() + 1)?;
         queue(&mut o, style::SetForegroundColor(URL_TEXT_COLOR))?;
@@ -748,7 +748,10 @@ mod tests {
         style::Print("│ hello"),
     ]);
     validate!(square_bracket_1, "[test]", [style::Print("[test]")]);
-    validate!(square_bracket_2, "Text with [brackets]", [style::Print("Text with [brackets]")]);
+    validate!(square_bracket_2, "Text with [brackets]", [style::Print(
+        "Text with [brackets]"
+    )]);
     validate!(square_bracket_empty, "[]", [style::Print("[]")]);
     validate!(square_bracket_array, "a[i]", [style::Print("a[i]")]);
+    validate!(square_bracket_url_like, "[text] without url part", [style::Print("[text] without url part")]);
 }
