@@ -753,6 +753,10 @@ mod tests {
     )]);
     validate!(square_bracket_empty, "[]", [style::Print("[]")]);
     validate!(square_bracket_array, "a[i]", [style::Print("a[i]")]);
-    validate!(square_bracket_url_like_1, "[text] without url part", [style::Print("[text] without url part")]);
-    validate!(square_bracket_url_like_2, "[text](without url part", [style::Print("[text](without url part")]);
+    validate!(square_bracket_url_like_1, "[text] without url part", [style::Print(
+        "[text] without url part"
+    )]);
+    validate!(square_bracket_url_like_2, "[text](without url part", [style::Print(
+        "[text](without url part"
+    )]);
 }
