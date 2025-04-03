@@ -50,11 +50,11 @@ use fig_settings::Settings;
 use fig_util::CLI_BINARY_NAME;
 use input_source::InputSource;
 use parser::{
-    RecvError,
     RecvErrorKind,
     ResponseParser,
     ToolUse,
 };
+use regex::Regex;
 use serde_json::Map;
 use spinners::{
     Spinner,
@@ -65,6 +65,7 @@ use tokio::signal::unix::{
     SignalKind,
     signal,
 };
+use tools::gh_issue::GhIssueContext;
 use tools::{
     Tool,
     ToolSpec,
@@ -95,11 +96,13 @@ const WELCOME_TEXT: &str = color_print::cstr! {"
 • Help me understand my git status
 
 <em>/acceptall</em>    <black!>Toggles acceptance prompting for the session.</black!>
+<em>/issue</em>        <black!>Report an issue or make a feature request.</black!>
 <em>/profile</em>      <black!>(Beta) Manage profiles for the chat session</black!>
 <em>/context</em>      <black!>(Beta) Manage context files for a profile</black!>
 <em>/help</em>         <black!>Show the help dialogue</black!>
 <em>/quit</em>         <black!>Quit the application</black!>
 
+<cyan!>Use Alt+Enter to provide multi-line prompts.</cyan!>
 
 "};
 
@@ -107,8 +110,10 @@ const HELP_TEXT: &str = color_print::cstr! {"
 
 <magenta,em>q</magenta,em> (Amazon Q Chat)
 
+<cyan,em>Commands:</cyan,em>
 <em>/clear</em>        <black!>Clear the conversation history</black!>
 <em>/acceptall</em>    <black!>Toggles acceptance prompting for the session.</black!>
+<em>/issue</em>        <black!>Report an issue or make a feature request.</black!>
 <em>/help</em>         <black!>Show this help dialogue</black!>
 <em>/quit</em>         <black!>Quit the application</black!>
 <em>/profile</em>      <black!>Manage profiles</black!>
@@ -125,7 +130,9 @@ const HELP_TEXT: &str = color_print::cstr! {"
   <em>rm</em>          <black!>Remove file(s) from context [--global]</black!>
   <em>clear</em>       <black!>Clear all files from current context [--global]</black!>
 
+<cyan,em>Tips:</cyan,em>
 <em>!{command}</em>    <black!>Quickly execute a command in your current session</black!>
+<em>Alt+Enter</em>     <black!>Insert new-line to provide multi-line prompt. Alternatively, [Ctrl+j]</black!>
 
 "};
 
@@ -260,6 +267,8 @@ pub struct ChatContext<W: Write> {
     /// State used to keep track of tool use relation
     tool_use_status: ToolUseStatus,
     accept_all: bool,
+    /// Any failed requests that could be useful for error report/debugging
+    failed_request_ids: Vec<String>,
 }
 
 impl<W: Write> ChatContext<W> {
@@ -291,6 +300,7 @@ impl<W: Write> ChatContext<W> {
             tool_use_telemetry_events: HashMap::new(),
             tool_use_status: ToolUseStatus::Idle,
             accept_all,
+            failed_request_ids: Vec::new(),
         })
     }
 }
@@ -388,6 +398,9 @@ where
             });
         }
 
+        // Remove non-ASCII and ANSI characters.
+        let re = Regex::new(r"((\x9B|\x1B\[)[0-?]*[ -\/]*[@-~])|([^\x00-\x7F]+)").unwrap();
+
         loop {
             debug_assert!(next_state.is_some());
             let chat_state = next_state.take().unwrap_or_default();
@@ -428,11 +441,10 @@ where
             match result {
                 Ok(state) => next_state = Some(state),
                 Err(e) => {
-                    fn print_error<W: Write>(
-                        output: &mut W,
-                        prepend_msg: &str,
-                        report: Option<eyre::Report>,
-                    ) -> Result<(), std::io::Error> {
+                    let mut print_error = |output: &mut W,
+                                           prepend_msg: &str,
+                                           report: Option<eyre::Report>|
+                     -> Result<(), std::io::Error> {
                         queue!(
                             output,
                             style::SetAttribute(Attribute::Bold),
@@ -440,8 +452,18 @@ where
                         )?;
 
                         match report {
-                            Some(report) => queue!(output, style::Print(format!("{}: {:?}\n", prepend_msg, report)),)?,
-                            None => queue!(output, style::Print(prepend_msg), style::Print("\n"))?,
+                            Some(report) => {
+                                let text = re
+                                    .replace_all(&format!("{}: {:?}\n", prepend_msg, report), "")
+                                    .into_owned();
+
+                                queue!(output, style::Print(&text),)?;
+                                self.conversation_state.append_transcript(text);
+                            },
+                            None => {
+                                queue!(output, style::Print(prepend_msg), style::Print("\n"))?;
+                                self.conversation_state.append_transcript(prepend_msg.to_string());
+                            },
                         }
 
                         execute!(
@@ -449,7 +471,7 @@ where
                             style::SetAttribute(Attribute::Reset),
                             style::SetForegroundColor(Color::Reset),
                         )
-                    }
+                    };
 
                     error!(?e, "An error occurred processing the current state");
                     if self.interactive && self.spinner.is_some() {
@@ -560,6 +582,7 @@ where
             }
         };
 
+        self.conversation_state.append_user_transcript(&user_input);
         Ok(ChatState::HandleInput {
             input: user_input,
             tool_uses: Some(tool_uses),
@@ -648,6 +671,17 @@ where
                 ChatState::PromptUser {
                     tool_uses: Some(tool_uses),
                     skip_printing_tools: true,
+                }
+            },
+            Command::Issue { prompt } => {
+                let input = "I would like to report an issue or make a feature request";
+                ChatState::HandleInput {
+                    input: if let Some(prompt) = prompt {
+                        format!("{input}: {prompt}")
+                    } else {
+                        input.to_string()
+                    },
+                    tool_uses: Some(tool_uses),
                 }
             },
             Command::AcceptAll => {
@@ -834,40 +868,49 @@ where
                                 execute!(self.output, style::Print("\n"))?;
                             }
 
-                            // If expand flag is set, show the expanded files
-                            if expand {
-                                match context_manager.get_context_files(false).await {
-                                    Ok(context_files) => {
-                                        if context_files.is_empty() {
-                                            execute!(
-                                                self.output,
-                                                style::SetForegroundColor(Color::DarkGrey),
-                                                style::Print("No files matched the patterns.\n\n"),
-                                                style::SetForegroundColor(Color::Reset)
-                                            )?;
-                                        } else {
-                                            execute!(
-                                                self.output,
-                                                style::SetForegroundColor(Color::Green),
-                                                style::Print(format!("Expanded files ({}):\n", context_files.len())),
-                                                style::SetForegroundColor(Color::Reset)
-                                            )?;
-
-                                            for (filename, _) in context_files {
-                                                execute!(self.output, style::Print(format!("    {}\n", filename)))?;
-                                            }
-                                            execute!(self.output, style::Print("\n"))?;
-                                        }
-                                    },
-                                    Err(e) => {
+                            match context_manager.get_context_files(false).await {
+                                Ok(context_files) => {
+                                    if context_files.is_empty() {
                                         execute!(
                                             self.output,
-                                            style::SetForegroundColor(Color::Red),
-                                            style::Print(format!("Error expanding files: {}\n\n", e)),
+                                            style::SetForegroundColor(Color::DarkGrey),
+                                            style::Print("No files matched the configured context paths.\n\n"),
                                             style::SetForegroundColor(Color::Reset)
                                         )?;
-                                    },
-                                }
+                                    } else if expand {
+                                        // Show expanded file list when expand flag is set
+                                        execute!(
+                                            self.output,
+                                            style::SetForegroundColor(Color::Green),
+                                            style::Print(format!("Expanded files ({}):\n", context_files.len())),
+                                            style::SetForegroundColor(Color::Reset)
+                                        )?;
+
+                                        for (filename, _) in context_files {
+                                            execute!(self.output, style::Print(format!("    {}\n", filename)))?;
+                                        }
+                                        execute!(self.output, style::Print("\n"))?;
+                                    } else {
+                                        // Just show the count when expand flag is not set
+                                        execute!(
+                                            self.output,
+                                            style::SetForegroundColor(Color::Green),
+                                            style::Print(format!(
+                                                "Number of context files in use: {}\n",
+                                                context_files.len()
+                                            )),
+                                            style::SetForegroundColor(Color::Reset)
+                                        )?;
+                                    }
+                                },
+                                Err(e) => {
+                                    execute!(
+                                        self.output,
+                                        style::SetForegroundColor(Color::Red),
+                                        style::Print(format!("Error retrieving context files: {}\n\n", e)),
+                                        style::SetForegroundColor(Color::Reset)
+                                    )?;
+                                },
                             }
                         },
                         command::ContextSubcommand::Add { global, force, paths } => {
@@ -1105,78 +1148,81 @@ where
                         },
                     }
                 },
-                Err(RecvError {
-                    request_id,
-                    source: RecvErrorKind::StreamTimeout { source, duration },
-                }) => {
-                    error!(
-                        request_id,
-                        ?source,
-                        "Encountered a stream timeout after waiting for {}s",
-                        duration.as_secs()
-                    );
-                    if self.interactive {
-                        execute!(self.output, cursor::Hide)?;
-                        self.spinner = Some(Spinner::new(Spinners::Dots, "Dividing up the work...".to_string()));
-                    }
-                    // For stream timeouts, we'll tell the model to try and split its response into
-                    // smaller chunks.
-                    self.conversation_state
-                        .push_assistant_message(AssistantResponseMessage {
-                            message_id: None,
-                            content: "Response timed out - message took too long to generate".to_string(),
-                            tool_uses: None,
-                        });
-                    self.conversation_state
-                        .append_new_user_message(
-                            "You took too long to respond - try to split up the work into smaller steps.".to_string(),
-                        )
-                        .await;
-                    self.send_tool_use_telemetry().await;
-                    return Ok(ChatState::HandleResponseStream(
-                        self.client
-                            .send_message(self.conversation_state.as_sendable_conversation_state().await)
-                            .await?,
-                    ));
-                },
-                Err(RecvError {
-                    request_id,
-                    source:
+                Err(recv_error) => {
+                    if let Some(request_id) = &recv_error.request_id {
+                        self.failed_request_ids.push(request_id.clone());
+                    };
+
+                    match recv_error.source {
+                        RecvErrorKind::StreamTimeout { source, duration } => {
+                            error!(
+                                recv_error.request_id,
+                                ?source,
+                                "Encountered a stream timeout after waiting for {}s",
+                                duration.as_secs()
+                            );
+                            if self.interactive {
+                                execute!(self.output, cursor::Hide)?;
+                                self.spinner =
+                                    Some(Spinner::new(Spinners::Dots, "Dividing up the work...".to_string()));
+                            }
+                            // For stream timeouts, we'll tell the model to try and split its response into
+                            // smaller chunks.
+                            self.conversation_state
+                                .push_assistant_message(AssistantResponseMessage {
+                                    message_id: None,
+                                    content: "Response timed out - message took too long to generate".to_string(),
+                                    tool_uses: None,
+                                });
+                            self.conversation_state
+                                .append_new_user_message(
+                                    "You took too long to respond - try to split up the work into smaller steps."
+                                        .to_string(),
+                                )
+                                .await;
+                            self.send_tool_use_telemetry().await;
+                            return Ok(ChatState::HandleResponseStream(
+                                self.client
+                                    .send_message(self.conversation_state.as_sendable_conversation_state().await)
+                                    .await?,
+                            ));
+                        },
                         RecvErrorKind::UnexpectedToolUseEos {
                             tool_use_id,
                             name,
                             message,
-                        },
-                }) => {
-                    error!(
-                        request_id,
-                        tool_use_id, name, "The response stream ended before the entire tool use was received"
-                    );
-                    if self.interactive {
-                        execute!(self.output, cursor::Hide)?;
-                        self.spinner = Some(Spinner::new(
-                            Spinners::Dots,
-                            "The generated tool use was too large, trying to divide up the work...".to_string(),
-                        ));
-                    }
+                        } => {
+                            error!(
+                                recv_error.request_id,
+                                tool_use_id, name, "The response stream ended before the entire tool use was received"
+                            );
+                            if self.interactive {
+                                execute!(self.output, cursor::Hide)?;
+                                self.spinner = Some(Spinner::new(
+                                    Spinners::Dots,
+                                    "The generated tool use was too large, trying to divide up the work...".to_string(),
+                                ));
+                            }
 
-                    self.conversation_state.push_assistant_message(*message);
-                    let tool_results = vec![ToolResult {
-                            tool_use_id,
-                            content: vec![ToolResultContentBlock::Text(
-                                "The generated tool was too large, try again but this time split up the work between multiple tool uses".to_string(),
-                            )],
-                            status: ToolResultStatus::Error,
-                        }];
-                    self.conversation_state.add_tool_results(tool_results);
-                    self.send_tool_use_telemetry().await;
-                    return Ok(ChatState::HandleResponseStream(
-                        self.client
-                            .send_message(self.conversation_state.as_sendable_conversation_state().await)
-                            .await?,
-                    ));
+                            self.conversation_state.push_assistant_message(*message);
+                            let tool_results = vec![ToolResult {
+                                    tool_use_id,
+                                    content: vec![ToolResultContentBlock::Text(
+                                        "The generated tool was too large, try again but this time split up the work between multiple tool uses".to_string(),
+                                    )],
+                                    status: ToolResultStatus::Error,
+                                }];
+                            self.conversation_state.add_tool_results(tool_results);
+                            self.send_tool_use_telemetry().await;
+                            return Ok(ChatState::HandleResponseStream(
+                                self.client
+                                    .send_message(self.conversation_state.as_sendable_conversation_state().await)
+                                    .await?,
+                            ));
+                        },
+                        _ => return Err(recv_error.into()),
+                    }
                 },
-                Err(err) => return Err(err.into()),
             }
 
             // Fix for the markdown parser copied over from q chat:
@@ -1282,6 +1328,9 @@ where
                 .utterance_id(self.conversation_state.message_id().map(|s| s.to_string()));
             match Tool::try_from(tool_use) {
                 Ok(mut tool) => {
+                    // Apply non-Q-generated context to tools
+                    self.contextualize_tool(&mut tool);
+
                     match tool.validate(&self.ctx).await {
                         Ok(()) => {
                             tool_telemetry.is_valid = Some(true);
@@ -1363,6 +1412,29 @@ where
             }),
             (false, false) => Err(ChatError::NonInteractiveToolApproval),
         }
+    }
+
+    /// Apply program context to tools that Q may not have.
+    // We cannot attach this any other way because Tools are constructed by deserializing
+    // output from Amazon Q.
+    // TODO: Is there a better way?
+    fn contextualize_tool(&self, tool: &mut Tool) {
+        #[allow(clippy::single_match)]
+        match tool {
+            Tool::GhIssue(gh_issue) => {
+                gh_issue.set_context(GhIssueContext {
+                    // Ideally we avoid cloning, but this function is not called very often.
+                    // Using references with lifetimes requires a large refactor, and Arc<Mutex<T>>
+                    // seems like overkill and may incur some performance cost anyway.
+                    context_manager: self.conversation_state.context_manager.clone(),
+                    transcript: self.conversation_state.transcript.clone(),
+                    failed_request_ids: self.failed_request_ids.clone(),
+                    accept_all: self.accept_all,
+                    interactive: self.interactive,
+                });
+            },
+            _ => (),
+        };
     }
 
     async fn print_tool_descriptions(&mut self, tool_uses: &[QueuedTool]) -> Result<(), ChatError> {
